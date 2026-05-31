@@ -61,4 +61,4 @@ Set via CLI flag (`-x`) or standard environment variables:
 
 ## License
 
-This project is not explicitly licensed. Contact the author for usage terms.
+MIT
