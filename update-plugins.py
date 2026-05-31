@@ -114,6 +114,27 @@ for _tb_name, _alias_list in {
 
 MARKETPLACE = "https://plugins.jetbrains.com"
 
+# ─── platform detection ──────────────────────────────────────────────────────
+
+import platform as _platform
+
+_PLATFORM_TAG: str = ""
+match (_platform.system(), _platform.machine()):
+    case ("Linux", "x86_64"):   _PLATFORM_TAG = "linux-x86_64"
+    case ("Linux", "aarch64"):  _PLATFORM_TAG = "linux-arm64"
+    case ("Darwin", "x86_64"):  _PLATFORM_TAG = "mac-x86_64"
+    case ("Darwin", "arm64"):   _PLATFORM_TAG = "mac-arm64"
+    case ("Windows", "AMD64"):  _PLATFORM_TAG = "windows-x86_64"
+    case ("Windows", "ARM64"):  _PLATFORM_TAG = "windows-arm64"
+
+def _extract_platform(version: str) -> str:
+    """Extract platform tag from a version string like '262.6653.22-linux-x86_64'."""
+    for tag in ("linux-x86_64", "linux-arm64", "mac-x86_64", "mac-arm64",
+                "windows-x86_64", "windows-arm64"):
+        if version.endswith(tag):
+            return tag
+    return ""
+
 # ─── data classes ─────────────────────────────────────────────────────────────
 
 @dataclass
@@ -541,19 +562,42 @@ def _fetch_one_plugin(xml_id: str, build: str) -> Optional[dict]:
         )
         if resp.status_code == 200:
             updates = resp.json()
+            # Collect all compatible updates
+            compatible: list[dict] = []
             for u in updates:
                 since = u.get("since", "")
                 until = u.get("until", "")
                 if _is_build_compatible(build, since, until):
-                    file_path = u.get("file", "")
-                    url = f"{MARKETPLACE}/files/{file_path}" if file_path else ""
-                    return {
-                        "version": u.get("version", ""),
-                        "url": url,
-                        "since-build": since,
-                        "until-build": until,
-                        "numeric_id": str(num_id),
-                    }
+                    compatible.append(u)
+
+            if compatible:
+                # Prefer matching platform, then platform-independent, then any
+                best = None
+                for u in compatible:
+                    plat = _extract_platform(u.get("version", ""))
+                    if plat == _PLATFORM_TAG:
+                        best = u
+                        break
+                if not best:
+                    for u in compatible:
+                        plat = _extract_platform(u.get("version", ""))
+                        if not plat:
+                            best = u
+                            break
+                if not best:
+                    best = compatible[0]
+
+                since = best.get("since", "")
+                until = best.get("until", "")
+                file_path = best.get("file", "")
+                url = f"{MARKETPLACE}/files/{file_path}" if file_path else ""
+                return {
+                    "version": best.get("version", ""),
+                    "url": url,
+                    "since-build": since,
+                    "until-build": until,
+                    "numeric_id": str(num_id),
+                }
             # Found on Marketplace but no compatible version for this build
             return {"version": "", "url": "", "numeric_id": str(num_id), "_no_compat": True}
     except (requests.RequestException, ValueError):
@@ -596,8 +640,12 @@ def _ver_tuple(v: str) -> tuple:
     Convert a version string to a comparable tuple.
 
     Handles: 1.2.3, 2024.1.3, 1.0-EAP, 2.0.0-beta.1, etc.
-    Numeric parts sort before string parts so 1.0 < 1.0-EAP is avoided.
+    Platform tags (linux-x86_64, etc.) are stripped before comparison.
     """
+    # Strip platform tag for comparison
+    plat = _extract_platform(v)
+    if plat:
+        v = v[: -len(plat)].rstrip("-_")
     parts = re.split(r"[.\-_+]", v.strip())
     out: list = []
     for p in parts:
