@@ -15,6 +15,7 @@ Usage
     update-plugins <ide>              # check and install updates
     update-plugins <ide> --dry-run   # check only, do not install
     update-plugins <ide> --list-only # list installed plugins and exit
+    update-plugins <ide> -i "plugin name"  # search & install a new plugin
 
 IDE aliases
 -----------
@@ -35,6 +36,7 @@ IDE aliases
     dataspell / ds                     DataSpell
     gateway / gw                       Gateway
     mps                                MPS
+    android-studio / as / android      Android Studio
 
 Requirements
 ------------
@@ -107,6 +109,7 @@ for _tb_name, _alias_list in {
     "DataSpell":   ["dataspell",   "ds"],
     "Gateway":     ["gateway",     "gw"],
     "MPS":         ["mps"],
+    "Android Studio": ["android-studio", "as", "android"],
 }.items():
     _TB_ALIASES[_tb_name] = _alias_list
     for _a in _alias_list:
@@ -306,6 +309,16 @@ def _user_plugins_dir(data_dir_name: str) -> Path:
         direct = jb / data_dir_name
         if _looks_like_plugins_dir(direct):
             return direct
+
+    # Google vendor dir (Android Studio uses Google/<data_dir>/ instead of JetBrains/<data_dir>/)
+    google = xdg / "Google"
+    if google.is_dir():
+        gs = google / data_dir_name / "plugins"
+        if gs.exists():
+            return gs
+        gd = google / data_dir_name
+        if _looks_like_plugins_dir(gd):
+            return gd
 
     # macOS
     mac = home / "Library" / "Application Support" / "JetBrains" / data_dir_name / "plugins"
@@ -678,7 +691,256 @@ def compute_updates(plugins: list[Plugin], remote: dict[str, dict[str, str]]) ->
             ))
     return updates
 
-# ─── installation ─────────────────────────────────────────────────────────────
+# ─── Marketplace search (for --install) ───────────────────────────────────────
+
+def _search_marketplace(query: str, max_results: int = 20) -> list[dict]:
+    """Search the JetBrains Marketplace by name/xmlId/vendor."""
+    try:
+        resp = _session.get(
+            f"{MARKETPLACE}/api/searchPlugins",
+            params={"search": query, "max": max_results},
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            return resp.json().get("plugins", [])
+    except (requests.RequestException, ValueError):
+        pass
+    return []
+
+
+def _prompt_select(options: list[str], header: str) -> Optional[int]:
+    """Show a numbered list and let the user pick one.  Returns index or None."""
+    console.print()
+    console.print(Rule(f"[bold]{header}[/bold]", style="dim cyan"))
+    console.print()
+    for i, line in enumerate(options, 1):
+        console.print(f"  [cyan]{i:>3}[/cyan]  {line}")
+    console.print()
+    console.print("  [dim]Enter number to install, or [bold]q[/bold] to cancel.[/dim]")
+    console.print()
+
+    while True:
+        try:
+            raw = input("  choice ▸ ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            return None
+        if raw.lower() in ("q", "quit", "exit", ""):
+            return None
+        try:
+            n = int(raw)
+            if 1 <= n <= len(options):
+                return n - 1
+        except ValueError:
+            pass
+        console.print(f"  [red]Please enter a number between 1 and {len(options)}.[/red]")
+
+
+def _install_fresh_plugin(
+    plugin_id: int,
+    plugins_dir: Path,
+    build: str,
+    progress: Progress,
+    task,
+) -> tuple[bool, str]:
+    """Download the latest compatible version of a Marketplace plugin and install it."""
+    try:
+        resp = _session.get(
+            f"{MARKETPLACE}/api/plugins/{plugin_id}/updates",
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            return False, f"Marketplace returned HTTP {resp.status_code}"
+
+        updates = resp.json()
+        compatible = [
+            u for u in updates
+            if _is_build_compatible(build, u.get("since", ""), u.get("until", ""))
+        ]
+        if not compatible:
+            return False, "no version compatible with this IDE build"
+
+        # Prefer matching platform, then platform-independent, then any
+        best = None
+        for u in compatible:
+            if _extract_platform(u.get("version", "")) == _PLATFORM_TAG:
+                best = u
+                break
+        if not best:
+            for u in compatible:
+                if not _extract_platform(u.get("version", "")):
+                    best = u
+                    break
+        if not best:
+            best = compatible[0]
+
+        file_path = best.get("file", "")
+        if not file_path:
+            return False, "no download file in Marketplace response"
+        url = f"{MARKETPLACE}/files/{file_path}"
+
+        with _session.get(url, stream=True, timeout=120, allow_redirects=True) as r:
+            r.raise_for_status()
+            total = int(r.headers.get("content-length", 0))
+            if total:
+                progress.update(task, total=total)
+            with tempfile.TemporaryDirectory() as tmp:
+                dl = Path(tmp) / "plugin.zip"
+                done = 0
+                with open(dl, "wb") as fh:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            fh.write(chunk)
+                            done += len(chunk)
+                            progress.update(task, completed=done)
+
+                if not zipfile.is_zipfile(dl):
+                    return False, "downloaded file is not a valid ZIP"
+
+                with zipfile.ZipFile(dl, "r") as zf:
+                    members = zf.namelist()
+                    roots = {m.split("/")[0] for m in members if m.strip("/")}
+                    if len(roots) == 1:
+                        zf.extractall(plugins_dir)
+                    else:
+                        # flat / multi-root → figure out the plugin dir name from xmlId
+                        plugin_xml = None
+                        for n in members:
+                            if n.endswith("/plugin.xml"):
+                                plugin_xml = zf.read(n)
+                                break
+                        if plugin_xml:
+                            root_el = ET.fromstring(plugin_xml)
+                            pid = (root_el.findtext("id") or "").strip()
+                        else:
+                            pid = ""
+                        target = plugins_dir / (pid or str(plugin_id))
+                        target.mkdir(parents=True, exist_ok=True)
+                        zf.extractall(target)
+
+        return True, best.get("version", "?")
+
+    except requests.HTTPError as exc:
+        return False, f"HTTP {exc.response.status_code}"
+    except requests.Timeout:
+        return False, "download timed out"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def install_new_plugin(
+    query: str,
+    ide: IDEInfo,
+    proxy: Optional[str] = None,
+) -> None:
+    """Interactive workflow: search → select → install a new plugin."""
+    if proxy:
+        _session.proxies = {"http": proxy, "https": proxy}
+
+    console.print()
+    console.print(Panel.fit(
+        f"[bold cyan]Install Plugin[/bold cyan]  [dim]·[/dim]  "
+        f"[yellow]{escape(query)}[/yellow]",
+        border_style="cyan",
+    ))
+    console.print()
+
+    # ── Resolve plugins dir ────────────────────────────────────────────────────
+    plugins_dir = ide.plugins_dir
+    if not plugins_dir.is_dir():
+        plugins_dir.mkdir(parents=True, exist_ok=True)
+    console.print(f"[green]✓[/green]  Plugins: [dim]{plugins_dir}[/dim]")
+
+    # ── Search ─────────────────────────────────────────────────────────────────
+    with _spin(f"Searching Marketplace for [cyan]{escape(query)}[/cyan]…") as sp:
+        sp.add_task("")
+        results = _search_marketplace(query)
+
+    if not results:
+        console.print(
+            f"[red]✗[/red]  No results found for [bold]{escape(query)}[/bold]."
+        )
+        return
+
+    # ── Filter out already-installed ───────────────────────────────────────────
+    installed_xml_ids = {
+        p.xml_id for p in scan_plugins(plugins_dir)
+    }
+    new_results = [r for r in results if r.get("xmlId") not in installed_xml_ids]
+
+    if not new_results:
+        console.print(
+            f"[yellow]⚠[/yellow]  All {len(results)} result(s) are already installed."
+        )
+        return
+
+    # ── Build selectable list ──────────────────────────────────────────────────
+    options: list[str] = []
+    for r in new_results:
+        name = r.get("name", "?")
+        xml_id = r.get("xmlId", "")
+        vendor = r.get("organization", "")
+        downloads = r.get("downloads", 0)
+        tag = r.get("tag", "")
+        parts = [
+            f"[bold]{escape(name)}[/bold]",
+            f"[dim]{escape(xml_id)}[/dim]",
+        ]
+        if vendor:
+            parts.append(f"[dim]by {escape(vendor)}[/dim]")
+        if downloads:
+            parts.append(f"[dim]{downloads:,} downloads[/dim]")
+        if tag:
+            parts.append(f"[yellow]{escape(tag)}[/yellow]")
+        options.append("  ".join(parts))
+
+    # ── Interactive selection ──────────────────────────────────────────────────
+    idx = _prompt_select(options, f"Results for \"{escape(query)}\"")
+    if idx is None:
+        console.print("[dim]Cancelled.[/dim]")
+        return
+
+    chosen = new_results[idx]
+    chosen_name = chosen.get("name", "?")
+    chosen_id = chosen["id"]
+
+    console.print()
+    console.print(
+        f"  [green]→[/green]  Installing [bold]{escape(chosen_name)}[/bold] …"
+    )
+
+    # ── Download & install ─────────────────────────────────────────────────────
+    with Progress(
+        TextColumn("[bold]{task.description}", justify="left"),
+        BarColumn(bar_width=28),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        label = (
+            f"[cyan]{escape(chosen_name)}[/cyan]"
+        )
+        task = progress.add_task(label, total=None)
+        ok, msg = _install_fresh_plugin(chosen_id, plugins_dir, ide.build, progress, task)
+        progress.update(task, visible=False)
+
+    console.print()
+    if ok:
+        console.print(Panel(
+            f"[bold green]✓[/bold green]  Installed [bold]{escape(chosen_name)}[/bold] "
+            f"version [green]{escape(msg)}[/green]\n"
+            "[dim]Restart your IDE to apply the changes.[/dim]",
+            border_style="green",
+        ))
+    else:
+        console.print(Panel(
+            f"[bold red]✗[/bold red]  Failed to install "
+            f"[bold]{escape(chosen_name)}[/bold]: [red]{escape(msg)}[/red]",
+            border_style="red",
+        ))
+
+# ─── installation (updates) ───────────────────────────────────────────────────
 
 def install_plugin(
     upd: Update,
@@ -1015,6 +1277,11 @@ def main() -> None:
         help="Override the plugins directory (useful for non-Toolbox installs)",
     )
     ap.add_argument(
+        "-i", "--install",
+        metavar="QUERY",
+        help="Search the Marketplace for a plugin and install it interactively",
+    )
+    ap.add_argument(
         "-x", "--proxy",
         metavar="URL",
         help="Proxy URL (e.g. http://127.0.0.1:10808 or socks5://127.0.0.1:10808)",
@@ -1029,13 +1296,33 @@ def main() -> None:
         raise SystemExit(1)
 
     try:
-        run(
-            ide_arg=args.ide,
-            dry_run=args.dry_run,
-            list_only=args.list_only,
-            plugins_dir_override=plugins_dir_override,
-            proxy=args.proxy,
-        )
+        if args.install:
+            # ── install-new-plugin mode ────────────────────────────────────────
+            with _spin(f"Locating [cyan]{escape(args.ide)}[/cyan] installation…") as p:
+                p.add_task("")
+                ide = find_ide(args.ide, plugins_dir_override)
+            if ide is None:
+                console.print(
+                    f"[red]✗[/red]  IDE [bold]{escape(args.ide)}[/bold] not found."
+                )
+                raise SystemExit(1)
+            console.print(
+                f"[green]✓[/green]  [bold]{escape(ide.name)}[/bold] {ide.version}  "
+                f"[dim](build {ide.build})[/dim]"
+            )
+            install_new_plugin(
+                query=args.install,
+                ide=ide,
+                proxy=args.proxy,
+            )
+        else:
+            run(
+                ide_arg=args.ide,
+                dry_run=args.dry_run,
+                list_only=args.list_only,
+                plugins_dir_override=plugins_dir_override,
+                proxy=args.proxy,
+            )
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted.[/yellow]")
         raise SystemExit(130)
